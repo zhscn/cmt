@@ -129,11 +129,11 @@ impl Watcher {
     }
 
     fn process(&mut self) -> Result<()> {
-        let time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("get timestamp")?
-            .as_millis() as u64;
         for (osd, asok) in self.asoks.iter_mut() {
+            let time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .context("get timestamp")?
+                .as_millis() as u64;
             let sample = asok.sampling()?;
             self.result.get_mut(osd).unwrap().push(time, &sample);
         }

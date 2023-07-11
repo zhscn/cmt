@@ -11,7 +11,7 @@ type JsonValue = serde_json::Value;
 type JsonMap<T, U> = serde_json::Map<T, U>;
 
 fn read_json(path: &PathBuf) -> Result<Vec<u8>> {
-    let mut stream = UnixStream::connect(&path)?;
+    let mut stream = UnixStream::connect(path)?;
     stream.write_all("{\"prefix\":\"dump_metrics\"}\0".as_bytes())?;
 
     let mut reader = BufReader::new(stream);
