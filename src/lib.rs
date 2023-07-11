@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use bincode::{config, Decode, Encode};
 use colored::Colorize;
 use regex::Regex;
+use rustyline::DefaultEditor;
 use std::{
     collections::BTreeMap,
     fmt::Display,
@@ -183,10 +184,24 @@ pub fn query(file: &PathBuf) -> Result<()> {
     let cfg = config::standard();
     let metrics: BTreeMap<String, WatchResultPerOSD> =
         bincode::decode_from_std_read(&mut file, cfg)?;
-    for (osd, res) in metrics {
-        println!("{} {} {}", osd, res.i.map.len(), res.f.map.len());
-        for m in res.i.map {
-            println!("{} {}", m.0, m.1.len());
+    let mut rl = DefaultEditor::new()?;
+    loop {
+        let line = rl.readline(">>> ");
+        if let Ok(line) = line {
+            let re =
+                Regex::new(&line).with_context(|| format!("can not build regex from: {}", line))?;
+            for (_, res) in metrics.iter() {
+                for m in res.i.map.iter() {
+                    if re.is_match(&m.0.name) {
+                        println!("{}", m.0);
+                        for v in m.1.iter() {
+                            println!("{} {}", v.0, v.1);
+                        }
+                    }
+                }
+            }
+        } else {
+            break;
         }
     }
     Ok(())
