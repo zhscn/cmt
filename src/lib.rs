@@ -1,9 +1,21 @@
 mod asok;
 
 use anyhow::{Context, Result};
-use regex::Regex;
-use std::{collections::BTreeMap, path::PathBuf, fmt::Display};
+use bincode::{config, Decode, Encode};
 use colored::Colorize;
+use regex::Regex;
+use std::{
+    collections::BTreeMap,
+    fmt::Display,
+    fs,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Default, Debug, Clone)]
 struct MetricInfo {
@@ -11,11 +23,15 @@ struct MetricInfo {
     labels: BTreeMap<String, String>,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 struct MetricUnifiedInfo {
-    name: String
+    name: String,
 }
-type Metrics<T> = BTreeMap<MetricUnifiedInfo, T>;
+
+#[derive(Default, Encode, Decode)]
+struct Metrics<T> {
+    map: BTreeMap<MetricUnifiedInfo, T>,
+}
 
 impl From<MetricInfo> for MetricUnifiedInfo {
     fn from(value: MetricInfo) -> Self {
@@ -60,23 +76,118 @@ pub fn get(path: &PathBuf, pattern: &str) -> Result<()> {
     asok.check()?;
     let mut metrics = asok.sampling()?;
     let re = Regex::new(pattern).with_context(|| format!("can't build regex from {}", pattern))?;
-    for metric in metrics.i_values.iter_mut() {
+
+    for metric in metrics.i_values.map.iter_mut() {
         if re.is_match(&metric.0.name) {
             println!("{} {}", metric.0, metric.1.to_string().green());
         }
     }
-    for metric in metrics.f_values.iter_mut() {
+
+    for metric in metrics.f_values.map.iter_mut() {
         if re.is_match(&metric.0.name) {
             println!("{} {}", metric.0, metric.1.to_string().green());
         }
     }
+
     Ok(())
 }
 
+#[derive(Default, Encode, Decode)]
+struct WatchResultPerOSD {
+    i: Metrics<Vec<(u64, i64)>>,
+    f: Metrics<Vec<(u64, f64)>>,
+}
+
+impl WatchResultPerOSD {
+    fn push(&mut self, t: u64, sample: &asok::Sample) {
+        for i in sample.i_values.map.iter() {
+            let v = self.i.map.entry(i.0.clone()).or_default();
+            v.push((t, *i.1));
+        }
+        for f in sample.f_values.map.iter() {
+            let v = self.f.map.entry(f.0.clone()).or_default();
+            v.push((t, *f.1));
+        }
+    }
+}
+
+struct Watcher {
+    asoks: Vec<(String, asok::Asok)>,
+    result: BTreeMap<String, WatchResultPerOSD>,
+}
+
+impl Watcher {
+    fn new(paths: &Vec<PathBuf>) -> Self {
+        let mut asoks = Vec::<(String, asok::Asok)>::default();
+        let mut result = BTreeMap::<String, WatchResultPerOSD>::default();
+        for path in paths {
+            let osd = path.as_os_str().to_str().unwrap().to_string();
+            asoks.push((osd.clone(), asok::Asok::from(path)));
+            result.insert(osd, WatchResultPerOSD::default());
+        }
+        Self { asoks, result }
+    }
+
+    fn process(&mut self) -> Result<()> {
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("get timestamp")?
+            .as_millis() as u64;
+        for (osd, asok) in self.asoks.iter_mut() {
+            let sample = asok.sampling()?;
+            self.result.get_mut(osd).unwrap().push(time, &sample);
+        }
+        Ok(())
+    }
+
+    fn store(&self) -> Result<()> {
+        let cfg = config::standard();
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open("data")?;
+        bincode::encode_into_std_write(&self.result, &mut file, cfg)?;
+        Ok(())
+    }
+}
+
 pub fn watch(paths: &Vec<PathBuf>, interval: u64) -> Result<()> {
-    unimplemented!();
+    let exit = Arc::new(AtomicBool::new(false));
+    let mut i: u64 = 0;
+
+    {
+        let exit = exit.clone();
+        ctrlc::set_handler(move || {
+            exit.store(true, Ordering::SeqCst);
+        })?;
+    }
+
+    let mut watcher = Watcher::new(paths);
+
+    while !exit.load(Ordering::SeqCst) {
+        if i % interval == 0 {
+            watcher.process()?;
+        }
+
+        thread::sleep(Duration::from_secs(1));
+        i += 1;
+    }
+
+    watcher.store()?;
+    Ok(())
 }
 
 pub fn query(file: &PathBuf) -> Result<()> {
-    unimplemented!();
+    let mut file = fs::OpenOptions::new().read(true).open(file)?;
+    let cfg = config::standard();
+    let metrics: BTreeMap<String, WatchResultPerOSD> =
+        bincode::decode_from_std_read(&mut file, cfg)?;
+    for (osd, res) in metrics {
+        println!("{} {} {}", osd, res.i.map.len(), res.f.map.len());
+        for m in res.i.map {
+            println!("{} {}", m.0, m.1.len());
+        }
+    }
+    Ok(())
 }

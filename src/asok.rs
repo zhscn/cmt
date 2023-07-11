@@ -24,9 +24,8 @@ fn read_json(path: &PathBuf) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-#[derive(Default)]
+#[derive(Default, Encode, Decode)]
 pub struct Sample {
-    pub timestamp: u64,
     pub(super) i_values: Metrics<i64>,
     pub(super) f_values: Metrics<f64>,
 }
@@ -74,14 +73,14 @@ impl Sample {
                 if n.is_i64() {
                     if metric_name.contains("ratio") {
                         let value = n.as_i64().context("cast to i64")? as f64;
-                        self.f_values.insert(metric_info.into(), value);
+                        self.f_values.map.insert(metric_info.into(), value);
                     } else {
                         let value = n.as_i64().context("cast to i64")?;
-                        self.i_values.insert(metric_info.into(), value);
+                        self.i_values.map.insert(metric_info.into(), value);
                     }
                 } else {
                     let value = n.as_f64().context("cast to f64")?;
-                    self.f_values.insert(metric_info.into(), value);
+                    self.f_values.map.insert(metric_info.into(), value);
                 }
             }
             JsonValue::Object(o) => {
@@ -95,7 +94,7 @@ impl Sample {
                     metric_info
                         .labels
                         .insert("bucket".to_string(), "count".to_string());
-                    self.i_values.insert(metric_info.into(), value);
+                    self.i_values.map.insert(metric_info.into(), value);
                 }
                 {
                     let mut metric_info = metric_info.clone();
@@ -108,7 +107,7 @@ impl Sample {
                     metric_info
                         .labels
                         .insert("bucket".to_string(), "sum".to_string());
-                    self.f_values.insert(metric_info.into(), value);
+                    self.f_values.map.insert(metric_info.into(), value);
                 }
                 let buckets = o
                     .get("buckets")
@@ -138,7 +137,7 @@ impl Sample {
                         .context("get count field of bucket")?
                         .as_i64()
                         .context("convert count to i64")?;
-                    self.i_values.insert(metric_info.into(), value);
+                    self.i_values.map.insert(metric_info.into(), value);
                 }
             }
             _ => bail!("unexpect value type"),
