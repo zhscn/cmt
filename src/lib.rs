@@ -1,10 +1,10 @@
 mod asok;
+mod plot;
 
 use anyhow::{Context, Result};
 use bincode::{config, Decode, Encode};
 use colored::Colorize;
 use regex::Regex;
-use rustyline::DefaultEditor;
 use std::{
     collections::BTreeMap,
     fmt::Display,
@@ -19,19 +19,19 @@ use std::{
 };
 
 #[derive(Default, Debug, Clone)]
-struct MetricInfo {
-    name: String,
-    labels: BTreeMap<String, String>,
+pub struct MetricInfo {
+    pub name: String,
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
-struct MetricUnifiedInfo {
-    name: String,
+pub struct MetricUnifiedInfo {
+    pub name: String,
 }
 
 #[derive(Default, Encode, Decode)]
-struct Metrics<T> {
-    map: BTreeMap<MetricUnifiedInfo, T>,
+pub struct Metrics<T> {
+    pub map: BTreeMap<MetricUnifiedInfo, T>,
 }
 
 impl From<MetricInfo> for MetricUnifiedInfo {
@@ -94,9 +94,9 @@ pub fn get(path: &PathBuf, pattern: &str) -> Result<()> {
 }
 
 #[derive(Default, Encode, Decode)]
-struct WatchResultPerOSD {
-    i: Metrics<Vec<(u64, i64)>>,
-    f: Metrics<Vec<(u64, f64)>>,
+pub struct WatchResultPerOSD {
+    pub i: Metrics<Vec<(u64, i64)>>,
+    pub f: Metrics<Vec<(u64, f64)>>,
 }
 
 impl WatchResultPerOSD {
@@ -112,15 +112,17 @@ impl WatchResultPerOSD {
     }
 }
 
+type WatchResult = BTreeMap<String, WatchResultPerOSD>;
+
 struct Watcher {
     asoks: Vec<(String, asok::Asok)>,
-    result: BTreeMap<String, WatchResultPerOSD>,
+    result: WatchResult,
 }
 
 impl Watcher {
     fn new(paths: &Vec<PathBuf>) -> Self {
         let mut asoks = Vec::<(String, asok::Asok)>::default();
-        let mut result = BTreeMap::<String, WatchResultPerOSD>::default();
+        let mut result = WatchResult::default();
         for path in paths {
             let osd = path.as_os_str().to_str().unwrap().to_string();
             asoks.push((osd.clone(), asok::Asok::from(path)));
@@ -179,30 +181,21 @@ pub fn watch(paths: &Vec<PathBuf>, interval: u64) -> Result<()> {
     Ok(())
 }
 
-pub fn query(file: &PathBuf) -> Result<()> {
+pub fn plot(file: &PathBuf, name: &str) -> Result<()> {
     let mut file = fs::OpenOptions::new().read(true).open(file)?;
     let cfg = config::standard();
-    let metrics: BTreeMap<String, WatchResultPerOSD> =
-        bincode::decode_from_std_read(&mut file, cfg)?;
-    let mut rl = DefaultEditor::new()?;
-    loop {
-        let line = rl.readline(">>> ");
-        if let Ok(line) = line {
-            let re =
-                Regex::new(&line).with_context(|| format!("can not build regex from: {}", line))?;
-            for (_, res) in metrics.iter() {
-                for m in res.i.map.iter() {
-                    if re.is_match(&m.0.name) {
-                        println!("{}", m.0);
-                        for v in m.1.iter() {
-                            println!("{} {}", v.0, v.1);
-                        }
-                    }
-                }
+    match bincode::decode_from_std_read(&mut file, cfg) {
+        Ok(metrics) => {
+            if name == "trans_conflict_ratio" {
+                plot::trans_conflict(&metrics, false)
+            } else if name == "trans_conflict_ratio_detailed" {
+                plot::trans_conflict(&metrics, true)
+            } else if name == "cpu_busy_ratio" {
+                plot::cpu_busy_ratio(&metrics)
+            } else {
+                Ok(())
             }
-        } else {
-            break;
         }
+        Err(_) => plot::foo()
     }
-    Ok(())
 }

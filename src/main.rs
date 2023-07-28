@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use cmt::{get, query, watch};
+use cmt::{get, plot, watch};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -27,10 +27,14 @@ enum Commands {
         #[arg(short, long, default_value_t = 15)]
         interval: u64,
     },
-    /// query and plot metrics
-    Query {
+    /// plot metrics
+    Plot {
         /// data file produeced by watch command
         file: PathBuf,
+        /// trans_conflict_ratio
+        /// trans_conflict_ratio_detailed
+        /// cpu_busy_ratio
+        name: String,
     },
 }
 
@@ -39,7 +43,7 @@ pub fn main() {
     if let Err(e) = match &cmt.commands {
         Commands::Get { path, pattern } => get(path, pattern),
         Commands::Watch { paths, interval } => watch(paths, *interval),
-        Commands::Query { file } => query(file),
+        Commands::Plot { file, name } => plot(file, name),
     } {
         eprintln!("error: {}", e);
     }
