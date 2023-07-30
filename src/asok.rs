@@ -24,33 +24,46 @@ fn read_json(path: &PathBuf) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
-#[derive(Default, Encode, Decode)]
+#[derive(Default, Debug, Clone)]
 pub struct Sample {
-    pub(super) i_values: Metrics<i64>,
-    pub(super) f_values: Metrics<f64>,
+    pub i: Vec<Metric<i64>>,
+    pub f: Vec<Metric<f64>>,
 }
 
 impl Sample {
-    fn parse_metric_object(&mut self, metric: &JsonMap<String, JsonValue>) -> Result<()> {
-        let mut metric_info = MetricInfo::default();
-        let (metric_name, metric_labels) = metric
+    /// json example:
+    ///
+    /// {
+    ///   "LBA_alloc_extents": {
+    ///     "shard": "0",
+    ///     "value": 86
+    ///   }
+    /// }
+    fn parse_json(&mut self, json: &JsonMap<String, JsonValue>) -> Result<()> {
+        let mut i_m = Metric::<i64>::default();
+
+        // metric_name: "LBA_alloc_extents"
+        // metrics_labes: {...}
+        let (metric_name, metric_labels) = json
             .iter()
             .next()
             .context("get first field in metric object")?;
-        metric_info.name = metric_name.clone();
 
-        let metric_labels = metric_labels
+        i_m.name = metric_name.clone();
+
+        // label_name: "shard"
+        // label_value: "0"
+        for (label_name, label_value) in metric_labels
             .as_object()
-            .context("convert the value of first field in metric object to object")?;
-
-        for (label_name, label_value) in metric_labels.iter() {
+            .context("convert metrics_labes to object")?
+            .iter()
+        {
             if label_name == "value" {
                 continue;
             }
 
-            let label_value = label_value
-                .as_str()
-                .context("convert label value to string")?;
+            let label_value = label_value.as_str().context("convert label_value to str")?;
+            // TODO: remove it
             let label_value = if label_name == "device_id" {
                 label_value
                     .as_bytes()
@@ -60,69 +73,84 @@ impl Sample {
             } else {
                 label_value.to_string()
             };
-            metric_info
-                .labels
-                .insert(label_name.to_string(), label_value);
+
+            i_m.labels.insert(label_name.to_string(), label_value);
         }
 
+        // process value
         match metric_labels
             .get("value")
-            .context("get value of metric labels")?
+            .context("get value from metic_labels")?
         {
             JsonValue::Number(n) => {
                 if n.is_i64() {
                     if metric_name.contains("ratio") {
-                        let value = n.as_i64().context("cast to i64")? as f64;
-                        self.f_values.map.insert(metric_info.into(), value);
+                        let mut f_m = Metric::<f64>::from(&i_m);
+                        f_m.value = n.as_i64().context("cast to i64")? as f64;
+                        self.f.push(f_m);
                     } else {
-                        let value = n.as_i64().context("cast to i64")?;
-                        self.i_values.map.insert(metric_info.into(), value);
+                        i_m.value = n.as_i64().context("cast to i64")?;
+                        self.i.push(i_m);
                     }
                 } else {
-                    let value = n.as_f64().context("cast to f64")?;
-                    self.f_values.map.insert(metric_info.into(), value);
+                    let mut f_m = Metric::<f64>::from(&i_m);
+                    f_m.value = n.as_f64().context("cast to i64")?;
+                    self.f.push(f_m);
                 }
             }
+            // {
+            //   "sum": 0,
+            //   "count": 0,
+            //   "buckets": [
+            //     {
+            //       "le": "1",
+            //       "count": 0
+            //     },
+            //     {
+            //       "le": "+Inf",
+            //       "count": 0
+            //     }
+            //   ]
+            // }
             JsonValue::Object(o) => {
+                // sum f64
                 {
-                    let mut metric_info = metric_info.clone();
-                    let value = o
-                        .get("count")
-                        .context("get bucket count")?
-                        .as_i64()
-                        .context("convert bucket count to i64")?;
-                    metric_info
-                        .labels
-                        .insert("bucket".to_string(), "count".to_string());
-                    self.i_values.map.insert(metric_info.into(), value);
+                    let mut f_m = Metric::<f64>::from(&i_m);
+                    f_m.value = o
+                        .get("sum")
+                        .map(|v| {
+                            if v.is_i64() {
+                                v.as_i64().unwrap() as f64
+                            } else {
+                                v.as_f64().unwrap()
+                            }
+                        })
+                        .context("get sum")?;
+                    self.f.push(f_m);
                 }
+                // count i64
                 {
-                    let mut metric_info = metric_info.clone();
-                    let value = o.get("sum").context("get bucket sum")?;
-                    let value = if value.is_i64() {
-                        value.as_i64().context("convert bucket sum value to i64")? as f64
-                    } else {
-                        value.as_f64().context("convert bucket sum value to f64")?
-                    };
-                    metric_info
-                        .labels
-                        .insert("bucket".to_string(), "sum".to_string());
-                    self.f_values.map.insert(metric_info.into(), value);
+                    let mut i_m = i_m.clone();
+                    i_m.value = o.get("count").map(|v| v.as_i64().unwrap()).unwrap();
+                    self.i.push(i_m);
                 }
-                let buckets = o
+                // buckets
+                for (i, bucket) in o
                     .get("buckets")
-                    .context("get buckets object")?
+                    .unwrap()
                     .as_array()
-                    .context("convert buckets object to array")?;
-                for (i, bucket) in buckets.iter().enumerate() {
-                    let mut metric_info = metric_info.clone();
-                    let bucket = bucket
-                        .as_object()
-                        .context("convert bucket object to object")?;
-                    metric_info
-                        .labels
-                        .insert("bucket".to_string(), i.to_string());
-                    let le = bucket.get("le").context("get le field of bucket")?;
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                {
+                    // bucket index label
+                    let mut i_m = i_m.clone();
+                    i_m.labels.insert("bucket".to_string(), i.to_string());
+
+                    let bucket = bucket.as_object().unwrap();
+
+                    // bucket le label
+                    let le = bucket.get("le").unwrap();
                     let le = if le.is_i64() {
                         le.as_i64().context("convert le to i64")?.to_string()
                     } else if le.is_f64() {
@@ -131,16 +159,15 @@ impl Sample {
                         assert!(le.is_string());
                         le.as_str().context("convert le to str")?.to_string()
                     };
-                    metric_info.labels.insert("le".to_string(), le);
-                    let value = bucket
-                        .get("count")
-                        .context("get count field of bucket")?
-                        .as_i64()
-                        .context("convert count to i64")?;
-                    self.i_values.map.insert(metric_info.into(), value);
+                    i_m.labels.insert("le".to_string(), le);
+
+                    // bucket count i64 as metric value
+                    i_m.value = bucket.get("count").unwrap().as_i64().unwrap();
+
+                    self.i.push(i_m);
                 }
             }
-            _ => bail!("unexpect value type"),
+            _ => bail!("unexpected value type"),
         }
         Ok(())
     }
@@ -184,7 +211,7 @@ impl Asok {
             .as_array()
             .context("convert metrics field value to array")?;
         for metric in metric_array {
-            sample.parse_metric_object(
+            sample.parse_json(
                 metric
                     .as_object()
                     .context("convert each metric element in array to obejct")?,

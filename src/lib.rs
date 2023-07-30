@@ -1,13 +1,14 @@
 mod asok;
+mod metric;
 mod plot;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bincode::{config, Decode, Encode};
 use colored::Colorize;
+pub use metric::*;
 use regex::Regex;
 use std::{
     collections::BTreeMap,
-    fmt::Display,
     fs,
     path::PathBuf,
     sync::{
@@ -18,75 +19,21 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Default, Debug, Clone)]
-pub struct MetricInfo {
-    pub name: String,
-    pub labels: BTreeMap<String, String>,
-}
-
-#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
-pub struct MetricUnifiedInfo {
-    pub name: String,
-}
-
-#[derive(Default, Encode, Decode)]
-pub struct Metrics<T> {
-    pub map: BTreeMap<MetricUnifiedInfo, T>,
-}
-
-impl From<MetricInfo> for MetricUnifiedInfo {
-    fn from(value: MetricInfo) -> Self {
-        let mut name = value.name.clone();
-        for (key, value) in value.labels.iter() {
-            name.push_str(&format!("&{}={}", key, value));
-        }
-        Self { name }
-    }
-}
-
-impl Display for MetricUnifiedInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut v = self.name.split('&').collect::<Vec<&str>>();
-        write!(f, "{} ", v.first().unwrap().red())?;
-        v.remove(0);
-        for p in v {
-            let v = p.split('=').collect::<Vec<&str>>();
-            for q in v.chunks_exact(2) {
-                write!(f, "{}: {} ", q[0].cyan(), q[1].italic())?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl From<&MetricUnifiedInfo> for MetricInfo {
-    fn from(value: &MetricUnifiedInfo) -> Self {
-        let v = value.name.split(&['&', '='][..]).collect::<Vec<&str>>();
-        assert!(v.len() > 1 && v.len() % 2 == 1);
-        let name = v.first().unwrap().to_string();
-        let mut labels = BTreeMap::<String, String>::new();
-        for p in v.rchunks_exact(2) {
-            labels.insert(p[0].to_string(), p[1].to_string());
-        }
-        Self { name, labels }
-    }
-}
-
 pub fn get(path: &PathBuf, pattern: &str) -> Result<()> {
     let asok = asok::Asok::from(path);
     asok.check()?;
     let mut metrics = asok.sampling()?;
     let re = Regex::new(pattern).with_context(|| format!("can't build regex from {}", pattern))?;
 
-    for metric in metrics.i_values.map.iter_mut() {
-        if re.is_match(&metric.0.name) {
-            println!("{} {}", metric.0, metric.1.to_string().green());
+    for metric in metrics.i.iter_mut() {
+        if re.is_match(metric.unified_name()) {
+            println!("{} {}", metric, metric.value.to_string().green());
         }
     }
 
-    for metric in metrics.f_values.map.iter_mut() {
-        if re.is_match(&metric.0.name) {
-            println!("{} {}", metric.0, metric.1.to_string().green());
+    for metric in metrics.f.iter_mut() {
+        if re.is_match(metric.unified_name()) {
+            println!("{} {}", metric, metric.value.to_string().green());
         }
     }
 
@@ -95,24 +42,76 @@ pub fn get(path: &PathBuf, pattern: &str) -> Result<()> {
 
 #[derive(Default, Encode, Decode)]
 pub struct WatchResultPerOSD {
-    pub i: Metrics<Vec<(u64, i64)>>,
-    pub f: Metrics<Vec<(u64, f64)>>,
+    pub index: BTreeMap<String, usize>,
+    pub timestamp: Vec<u64>,
+    pub i: Columns<i64>,
+    pub f: Columns<f64>,
 }
 
 impl WatchResultPerOSD {
-    fn push(&mut self, t: u64, sample: &asok::Sample) {
-        for i in sample.i_values.map.iter() {
-            let v = self.i.map.entry(i.0.clone()).or_default();
-            v.push((t, *i.1));
+    fn push(&mut self, t: u64, sample: &mut asok::Sample) {
+        self.timestamp.push(t);
+        if self.i.is_empty() {
+            for (no, i) in sample.i.iter().enumerate() {
+                let mut ic = Column::<i64>::from(i);
+                ic.value.push(i.value);
+                self.i.push(ic);
+                self.index
+                    .insert(self.i.get_mut(no).unwrap().unified_name().to_string(), no);
+            }
+            for (no, f) in sample.f.iter().enumerate() {
+                let mut fc = Column::<f64>::from(f);
+                fc.value.push(f.value);
+                self.f.push(fc);
+                self.index.insert(
+                    self.f.get_mut(no).unwrap().unified_name().to_string(),
+                    no + self.i.len(),
+                );
+            }
+        } else {
+            for (i, is) in sample.i.iter_mut().zip(self.i.iter_mut()) {
+                assert_eq!(i.unified_name(), is.unified_name());
+                is.value.push(i.value);
+            }
+            for (f, fs) in sample.f.iter_mut().zip(self.f.iter_mut()) {
+                assert_eq!(f.unified_name(), fs.unified_name());
+                fs.value.push(f.value);
+            }
         }
-        for f in sample.f_values.map.iter() {
-            let v = self.f.map.entry(f.0.clone()).or_default();
-            v.push((t, *f.1));
+    }
+    fn select(&self, pattern: &str) -> Result<Columns<f64>> {
+        let re = Regex::new(pattern).context("re")?;
+        let mut matched_indexs = Vec::<usize>::default();
+        for (k, v) in self.index.iter() {
+            if re.is_match(&k) {
+                matched_indexs.push(*v);
+            }
         }
+        if matched_indexs.is_empty() {
+            bail!("not fount")
+        }
+        let mut columns = Columns::<f64>::default();
+        for idx in matched_indexs {
+            if idx < self.i.len() {
+                let matched_column = self.i.get(idx).unwrap();
+                let mut column = Column::<f64>::from(matched_column);
+                column.value = matched_column.value.iter().map(|v| *v as f64).collect();
+                columns.push(column);
+            } else {
+                let idx = idx - self.i.len();
+                assert!(idx < self.f.len());
+                let matched_column = self.f.get(idx).unwrap();
+                let mut column = Column::<f64>::from(matched_column);
+                column.value = matched_column.value.clone();
+                columns.push(column);
+            }
+        }
+        Ok(columns)
     }
 }
 
-type WatchResult = BTreeMap<String, WatchResultPerOSD>;
+type OSDName = String;
+type WatchResult = BTreeMap<OSDName, WatchResultPerOSD>;
 
 struct Watcher {
     asoks: Vec<(String, asok::Asok)>,
@@ -124,7 +123,13 @@ impl Watcher {
         let mut asoks = Vec::<(String, asok::Asok)>::default();
         let mut result = WatchResult::default();
         for path in paths {
-            let osd = path.as_os_str().to_str().unwrap().to_string();
+            let osd = path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+                .replace(".asok", "");
             asoks.push((osd.clone(), asok::Asok::from(path)));
             result.insert(osd, WatchResultPerOSD::default());
         }
@@ -137,8 +142,8 @@ impl Watcher {
                 .duration_since(UNIX_EPOCH)
                 .context("get timestamp")?
                 .as_millis() as u64;
-            let sample = asok.sampling()?;
-            self.result.get_mut(osd).unwrap().push(time, &sample);
+            let mut sample = asok.sampling()?;
+            self.result.get_mut(osd).unwrap().push(time, &mut sample);
         }
         Ok(())
     }
@@ -181,21 +186,39 @@ pub fn watch(paths: &Vec<PathBuf>, interval: u64) -> Result<()> {
     Ok(())
 }
 
+fn list(metrics: &WatchResult) -> Result<()> {
+    let osd = metrics.iter().next().unwrap();
+    for i in osd.1.i.iter() {
+        println!("{}", i);
+    }
+    for f in osd.1.f.iter() {
+        println!("{}", f);
+    }
+    Ok(())
+}
+
 pub fn plot(file: &PathBuf, name: &str) -> Result<()> {
     let mut file = fs::OpenOptions::new().read(true).open(file)?;
     let cfg = config::standard();
     match bincode::decode_from_std_read(&mut file, cfg) {
         Ok(metrics) => {
-            if name == "trans_conflict_ratio" {
-                plot::trans_conflict(&metrics, false)
-            } else if name == "trans_conflict_ratio_detailed" {
-                plot::trans_conflict(&metrics, true)
-            } else if name == "cpu_busy_ratio" {
-                plot::cpu_busy_ratio(&metrics)
-            } else {
-                Ok(())
+            if name == "list" {
+                list(&metrics)?;
+                return Ok(());
             }
+
+            if name == "trans_conflict_ratio" || name == "all" {
+                plot::trans_conflict(&metrics, false)?
+            }
+            if name == "trans_conflict_ratio_detailed" || name == "all" {
+                plot::trans_conflict(&metrics, true)?
+            }
+            if name == "cpu_busy_ratio" || name == "all" {
+                plot::cpu_busy_ratio(&metrics)?
+            }
+
+            Ok(())
         }
-        Err(_) => plot::foo()
+        Err(_) => plot::foo(),
     }
 }
